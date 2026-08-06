@@ -1,0 +1,1235 @@
+#!/usr/bin/env bash
+set -e
+
+ROOT="roofing-crm"
+mkdir -p "$ROOT"
+cd "$ROOT"
+
+echo "Creating project structure..."
+mkdir -p backend bin backend/middleware backend/uploads frontend/src/frontend_components deploy/nginx .github/workflows
+
+########################
+# BACKEND files
+########################
+
+cat > backend/package.json <<'EOF'
+{
+  "name": "roofing-crm-backend",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "migrate": "node migrate.js",
+    "seed": "node seed-admin.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.0.3",
+    "express": "^4.18.2",
+    "jsonwebtoken": "^9.0.0",
+    "multer": "^1.4.5-lts.1",
+    "pg": "^8.11.0",
+    "uuid": "^9.0.0",
+    "aws-sdk": "^2.1360.0"
+  },
+  "devDependencies": {
+    "nodemon": "^2.0.22"
+  }
+}
+EOF
+
+cat > backend/docker.env.example <<'EOF'
+# copy to .env or docker.env and fill values
+PORT=4000
+DATABASE_URL=postgres://postgres:postgres@db:5432/roofing_crm
+JWT_SECRET=replace_with_a_strong_secret
+UPLOAD_DIR=/usr/src/app/uploads
+S3_ENABLED=false
+S3_BUCKET=
+S3_REGION=
+S3_ACCESS_KEY_ID=
+S3_SECRET_ACCESS_KEY=
+ADMIN_EMAIL=admin@example.com
+ADMIN_PASSWORD=password
+ADMIN_NAME=Admin
+RUN_MIGRATIONS=true
+SEED_ADMIN=true
+EOF
+
+cat > backend/migrations.sql <<'EOF'
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+CREATE TABLE IF NOT EXISTS users (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  name TEXT NOT NULL,
+  email TEXT UNIQUE NOT NULL,
+  password_hash TEXT NOT NULL,
+  role TEXT NOT NULL DEFAULT 'rep',
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS contacts (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  first_name TEXT,
+  last_name TEXT,
+  phone TEXT,
+  email TEXT,
+  company_name TEXT,
+  source TEXT,
+  status TEXT DEFAULT 'lead',
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS deals (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  contact_id UUID,
+  title TEXT,
+  pipeline_stage TEXT DEFAULT 'New',
+  estimated_value NUMERIC DEFAULT 0,
+  close_date DATE,
+  assigned_user_id UUID,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+  updated_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+  FOREIGN KEY(contact_id) REFERENCES contacts(id) ON DELETE SET NULL,
+  FOREIGN KEY(assigned_user_id) REFERENCES users(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS activities (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  deal_id UUID,
+  type TEXT,
+  description TEXT,
+  activity_date TIMESTAMP WITH TIME ZONE DEFAULT now(),
+  created_by_user_id UUID,
+  FOREIGN KEY(deal_id) REFERENCES deals(id) ON DELETE CASCADE,
+  FOREIGN KEY(created_by_user_id) REFERENCES users(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS uploads (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  filename TEXT NOT NULL,
+  original_name TEXT,
+  mime TEXT,
+  size INTEGER,
+  url TEXT,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+  uploaded_by UUID,
+  FOREIGN KEY(uploaded_by) REFERENCES users(id) ON DELETE SET NULL
+);
+EOF
+
+cat > backend/migrations-add-refresh.sql <<'EOF'
+CREATE TABLE IF NOT EXISTS refresh_tokens (
+  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id UUID NOT NULL,
+  token TEXT NOT NULL,
+  revoked BOOLEAN DEFAULT false,
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT now(),
+  expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+  FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_refresh_tokens_user_id ON refresh_tokens(user_id);
+EOF
+
+cat > backend/db.js <<'EOF'
+require('dotenv').config();
+const { Pool } = require('pg');
+
+const connectionString = process.env.DATABASE_URL || 'postgres://postgres:postgres@localhost:5432/roofing_crm';
+
+const pool = new Pool({ connectionString });
+
+module.exports = {
+  query: (text, params) => pool.query(text, params),
+  pool
+};
+EOF
+
+cat > backend/migrate.js <<'EOF'
+const fs = require('fs');
+const path = require('path');
+const db = require('./db');
+
+async function migrate() {
+  const sql = fs.readFileSync(path.join(__dirname, 'migrations.sql'), 'utf8');
+  try {
+    await db.query(sql);
+    // apply refresh migration if present
+    const add = path.join(__dirname, 'migrations-add-refresh.sql');
+    if (fs.existsSync(add)) {
+      const sql2 = fs.readFileSync(add, 'utf8');
+      await db.query(sql2);
+    }
+    console.log('Migrations applied');
+    process.exit(0);
+  } catch (err) {
+    console.error('Migration error', err);
+    process.exit(1);
+  }
+}
+
+migrate();
+EOF
+
+cat > backend/seed-admin.js <<'EOF'
+const bcrypt = require('bcryptjs');
+const db = require('./db');
+
+async function seed() {
+  const email = process.env.ADMIN_EMAIL || 'admin@example.com';
+  const password = process.env.ADMIN_PASSWORD || 'password';
+  const name = process.env.ADMIN_NAME || 'Admin';
+
+  const existing = await db.query('SELECT id FROM users WHERE email=$1', [email]);
+  if (existing.rows.length) {
+    console.log('Admin already exists');
+    process.exit(0);
+  }
+
+  const hash = await bcrypt.hash(password, 10);
+  await db.query('INSERT INTO users (name,email,password_hash,role) VALUES ($1,$2,$3,$4)', [name, email, hash, 'admin']);
+  console.log('Admin user created:', email);
+  process.exit(0);
+}
+
+seed().catch(err => { console.error(err); process.exit(1); });
+EOF
+
+cat > backend/auth.js <<'EOF'
+const jwt = require('jsonwebtoken');
+const db = require('./db');
+const { v4: uuidv4 } = require('uuid');
+
+const JWT_SECRET = process.env.JWT_SECRET || 'replace_with_a_strong_secret';
+const ACCESS_EXPIRES_IN = process.env.ACCESS_EXPIRES_IN || '15m';
+const REFRESH_EXPIRES_DAYS = parseInt(process.env.REFRESH_EXPIRES_DAYS || '30', 10);
+
+function signAccessToken(user) {
+  const payload = { id: user.id, name: user.name, email: user.email, role: user.role };
+  return jwt.sign(payload, JWT_SECRET, { expiresIn: ACCESS_EXPIRES_IN });
+}
+
+function verifyAccessToken(token) {
+  return jwt.verify(token, JWT_SECRET);
+}
+
+async function createRefreshToken(userId) {
+  const token = uuidv4() + '.' + uuidv4();
+  const expiresAt = new Date(Date.now() + REFRESH_EXPIRES_DAYS * 24 * 60 * 60 * 1000).toISOString();
+  await db.query('INSERT INTO refresh_tokens (user_id, token, expires_at) VALUES ($1,$2,$3)', [userId, token, expiresAt]);
+  return { token, expiresAt };
+}
+
+async function revokeRefreshToken(token) {
+  await db.query('UPDATE refresh_tokens SET revoked=true WHERE token=$1', [token]);
+}
+
+async function validateRefreshToken(token) {
+  const r = await db.query('SELECT id,user_id,revoked,expires_at FROM refresh_tokens WHERE token=$1', [token]);
+  if (!r.rows.length) throw new Error('Invalid refresh token');
+  const row = r.rows[0];
+  if (row.revoked) throw new Error('Token revoked');
+  if (new Date(row.expires_at) < new Date()) throw new Error('Token expired');
+  return row;
+}
+
+module.exports = {
+  signAccessToken,
+  verifyAccessToken,
+  createRefreshToken,
+  revokeRefreshToken,
+  validateRefreshToken
+};
+EOF
+
+cat > backend/middleware/authMiddleware.js <<'EOF'
+const db = require('../db');
+const { verifyAccessToken } = require('../auth');
+
+async function requireAuth(req, res, next) {
+  const auth = req.headers.authorization;
+  if (!auth || !auth.startsWith('Bearer ')) return res.status(401).json({ message: 'Missing token' });
+  const token = auth.slice(7);
+  try {
+    const payload = verifyAccessToken(token);
+    const r = await db.query('SELECT id,name,email,role FROM users WHERE id=$1', [payload.id]);
+    if (!r.rows.length) return res.status(401).json({ message: 'User not found' });
+    req.user = r.rows[0];
+    next();
+  } catch (err) {
+    res.status(401).json({ message: 'Invalid token' });
+  }
+}
+
+module.exports = { requireAuth };
+EOF
+
+cat > backend/middleware/rbac.js <<'EOF'
+function requireRole(...allowedRoles) {
+  return function (req, res, next) {
+    if (!req.user) return res.status(401).json({ message: 'Not authenticated' });
+    if (!allowedRoles.includes(req.user.role)) return res.status(403).json({ message: 'Forbidden' });
+    next();
+  };
+}
+
+module.exports = { requireRole };
+EOF
+
+cat > backend/s3.js <<'EOF'
+const AWS = require('aws-sdk');
+
+function createS3() {
+  const s3 = new AWS.S3({
+    accessKeyId: process.env.S3_ACCESS_KEY_ID,
+    secretAccessKey: process.env.S3_SECRET_ACCESS_KEY,
+    region: process.env.S3_REGION
+  });
+  return s3;
+}
+
+async function uploadToS3(buffer, key, mime) {
+  const s3 = createS3();
+  const params = {
+    Bucket: process.env.S3_BUCKET,
+    Key: key,
+    Body: buffer,
+    ContentType: mime,
+    ACL: 'private'
+  };
+  const res = await s3.upload(params).promise();
+  return res.Location;
+}
+
+module.exports = { uploadToS3 };
+EOF
+
+cat > backend/bin/wait-for-db.sh <<'EOF'
+#!/usr/bin/env bash
+set -e
+
+hostport="$1"
+timeout="${2:-30}"
+
+IFS=':' read -r host port <<< "$hostport"
+
+echo "Waiting for Postgres at $host:$port (timeout ${timeout}s)..."
+
+start_ts=$(date +%s)
+while true; do
+  if pg_isready -h "$host" -p "$port" >/dev/null 2>&1; then
+    echo "Postgres is ready"
+    exit 0
+  fi
+  now_ts=$(date +%s)
+  elapsed=$((now_ts - start_ts))
+  if [ "$elapsed" -ge "$timeout" ]; then
+    echo "Timed out waiting for Postgres"
+    exit 1
+  fi
+  sleep 1
+done
+EOF
+
+cat > backend/bin/entrypoint.sh <<'EOF'
+#!/usr/bin/env bash
+set -e
+
+if [ -f /usr/src/app/.env ]; then
+  export $(grep -v '^#' /usr/src/app/.env | xargs)
+fi
+
+DB_HOST=$(echo "${DATABASE_URL}" | sed -E 's#.*@([^:/]+).*#\1#' || echo "db")
+DB_PORT=$(echo "${DATABASE_URL}" | sed -E 's#.*:([0-9]+)/.*#\1#' || echo "5432")
+
+if command -v pg_isready >/dev/null 2>&1; then
+  /usr/src/app/bin/wait-for-db.sh "${DB_HOST}:${DB_PORT}" 60
+else
+  echo "pg_isready not found, sleeping 5s"
+  sleep 5
+fi
+
+if [ "${RUN_MIGRATIONS:-true}" = "true" ]; then
+  node migrate.js
+fi
+
+if [ "${SEED_ADMIN:-true}" = "true" ]; then
+  node seed-admin.js
+fi
+
+exec node server.js
+EOF
+
+chmod +x backend/bin/wait-for-db.sh backend/bin/entrypoint.sh
+
+cat > backend/server.js <<'EOF'
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const bcrypt = require('bcryptjs');
+const { v4: uuidv4 } = require('uuid');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
+const AWS = require('aws-sdk');
+
+const db = require('./db');
+const {
+  signAccessToken,
+  createRefreshToken,
+  revokeRefreshToken,
+  validateRefreshToken
+} = require('./auth');
+const { requireAuth } = require('./middleware/authMiddleware');
+const { requireRole } = require('./middleware/rbac');
+const { uploadToS3 } = require('./s3');
+
+const app = express();
+const PORT = process.env.PORT || 4000;
+
+app.use(cors());
+app.use(express.json());
+
+const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(__dirname, 'uploads');
+if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+
+const storage = multer.memoryStorage();
+const upload = multer({ storage, limits: { fileSize: 10 * 1024 * 1024 } });
+
+// Health
+app.get('/api/health', async (req, res) => {
+  try {
+    await db.query('SELECT 1');
+    res.json({ status: 'ok' });
+  } catch (err) {
+    res.status(500).json({ status: 'error', message: err.message });
+  }
+});
+
+// Register
+app.post('/api/register', async (req, res) => {
+  const { name, email, password, role } = req.body;
+  if (!name || !email || !password) return res.status(400).json({ message: 'Missing fields' });
+  const existing = await db.query('SELECT id FROM users WHERE email=$1', [email]);
+  if (existing.rows.length) return res.status(400).json({ message: 'Email already exists' });
+  const hash = await bcrypt.hash(password, 10);
+  const id = uuidv4();
+  await db.query('INSERT INTO users (id,name,email,password_hash,role) VALUES ($1,$2,$3,$4,$5)', [id, name, email, hash, role || 'rep']);
+  const user = { id, name, email, role: role || 'rep' };
+  const accessToken = signAccessToken(user);
+  const refresh = await createRefreshToken(user.id);
+  res.json({ user, accessToken, refreshToken: refresh.token });
+});
+
+// Login
+app.post('/api/login', async (req, res) => {
+  const { email, password } = req.body;
+  const r = await db.query('SELECT id,name,email,password_hash,role FROM users WHERE email=$1', [email]);
+  if (!r.rows.length) return res.status(401).json({ message: 'Invalid credentials' });
+  const user = r.rows[0];
+  const ok = await bcrypt.compare(password, user.password_hash);
+  if (!ok) return res.status(401).json({ message: 'Invalid credentials' });
+
+  const accessToken = signAccessToken(user);
+  const refresh = await createRefreshToken(user.id);
+  res.json({ user: { id: user.id, name: user.name, email: user.email, role: user.role }, accessToken, refreshToken: refresh.token });
+});
+
+// Token refresh
+app.post('/api/token/refresh', async (req, res) => {
+  const { refreshToken } = req.body;
+  if (!refreshToken) return res.status(400).json({ message: 'Missing refreshToken' });
+  try {
+    const row = await validateRefreshToken(refreshToken);
+    const userRow = (await db.query('SELECT id,name,email,role FROM users WHERE id=$1', [row.user_id])).rows[0];
+    if (!userRow) throw new Error('User not found');
+    await revokeRefreshToken(refreshToken);
+    const newRefresh = await createRefreshToken(userRow.id);
+    const accessToken = signAccessToken(userRow);
+    res.json({ accessToken, refreshToken: newRefresh.token });
+  } catch (err) {
+    res.status(401).json({ message: err.message || 'Invalid token' });
+  }
+});
+
+// Logout
+app.post('/api/logout', requireAuth, async (req, res) => {
+  const { refreshToken } = req.body;
+  if (refreshToken) {
+    await revokeRefreshToken(refreshToken);
+  }
+  res.json({ message: 'Logged out' });
+});
+
+// Contacts
+app.post('/api/contacts', requireAuth, async (req, res) => {
+  const { first_name, last_name, phone, email, company_name, source, status } = req.body;
+  const id = uuidv4();
+  await db.query(\`INSERT INTO contacts (id,first_name,last_name,phone,email,company_name,source,status) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)\`,
+    [id, first_name, last_name, phone, email, company_name, source || 'unknown', status || 'lead']);
+  const row = (await db.query('SELECT * FROM contacts WHERE id=$1', [id])).rows[0];
+  res.status(201).json(row);
+});
+
+app.get('/api/contacts', requireAuth, async (req, res) => {
+  const rows = (await db.query('SELECT * FROM contacts ORDER BY created_at DESC')).rows;
+  res.json(rows);
+});
+
+// Deals
+app.post('/api/deals', requireAuth, async (req, res) => {
+  const { contact_id, title, pipeline_stage, estimated_value, close_date, assigned_user_id } = req.body;
+  const id = uuidv4();
+  await db.query(\`INSERT INTO deals (id,contact_id,title,pipeline_stage,estimated_value,close_date,assigned_user_id) VALUES ($1,$2,$3,$4,$5,$6,$7)\`,
+    [id, contact_id, title, pipeline_stage || 'New', estimated_value || 0, close_date || null, assigned_user_id || null]);
+  const row = (await db.query('SELECT * FROM deals WHERE id=$1', [id])).rows[0];
+  res.status(201).json(row);
+});
+
+app.get('/api/deals', requireAuth, async (req, res) => {
+  const rows = (await db.query('SELECT * FROM deals ORDER BY updated_at DESC')).rows;
+  res.json(rows);
+});
+
+// Activities
+app.post('/api/activities', requireAuth, async (req, res) => {
+  const { deal_id, type, description, activity_date } = req.body;
+  const id = uuidv4();
+  await db.query(\`INSERT INTO activities (id,deal_id,type,description,activity_date,created_by_user_id) VALUES ($1,$2,$3,$4,$5,$6)\`,
+    [id, deal_id, type || 'note', description, activity_date || new Date().toISOString(), req.user.id]);
+  const row = (await db.query('SELECT * FROM activities WHERE id=$1', [id])).rows[0];
+  res.status(201).json(row);
+});
+
+app.get('/api/activities', requireAuth, async (req, res) => {
+  const rows = (await db.query('SELECT * FROM activities ORDER BY activity_date DESC')).rows;
+  res.json(rows);
+});
+
+// Uploads (local or S3)
+app.post('/api/uploads', requireAuth, upload.single('file'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ message: 'No file' });
+  const id = uuidv4();
+  const originalName = req.file.originalname;
+  const mime = req.file.mimetype;
+  const size = req.file.size;
+
+  if (process.env.S3_ENABLED === 'true') {
+    const key = \`uploads/\${id}-\${originalName}\`;
+    try {
+      const url = await uploadToS3(req.file.buffer, key, mime);
+      await db.query('INSERT INTO uploads (id,filename,original_name,mime,size,url,uploaded_by) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+        [id, key, originalName, mime, size, url, req.user.id]);
+      const row = (await db.query('SELECT * FROM uploads WHERE id=$1', [id])).rows[0];
+      return res.status(201).json(row);
+    } catch (err) {
+      console.error('S3 upload error', err);
+      return res.status(500).json({ message: 'Upload failed' });
+    }
+  } else {
+    const filename = \`\${id}-\${originalName}\`;
+    const filepath = path.join(UPLOAD_DIR, filename);
+    fs.writeFileSync(filepath, req.file.buffer);
+    const url = \`/uploads/\${filename}\`;
+    await db.query('INSERT INTO uploads (id,filename,original_name,mime,size,url,uploaded_by) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+      [id, filename, originalName, mime, size, url, req.user.id]);
+    const row = (await db.query('SELECT * FROM uploads WHERE id=$1', [id])).rows[0];
+    res.status(201).json(row);
+  }
+});
+
+// Presign for direct S3 upload
+app.get('/api/uploads/presign', requireAuth, async (req, res) => {
+  if (process.env.S3_ENABLED !== 'true') return res.status(400).json({ message: 'S3 not enabled' });
+
+  const { filename, contentType } = req.query;
+  if (!filename || !contentType) return res.status(400).json({ message: 'Missing filename or contentType' });
+
+  const s3 = new AWS.S3({
+    accessKeyId: process.env.S3_ACCESS_KEY_ID,
+    secretAccessKey: process.env.S3_SECRET_ACCESS_KEY,
+    region: process.env.S3_REGION
+  });
+
+  const key = \`uploads/\${Date.now()}-\${Math.random().toString(36).slice(2)}-\${filename}\`;
+
+  const params = {
+    Bucket: process.env.S3_BUCKET,
+    Key: key,
+    ContentType: contentType,
+    ACL: 'private',
+    Expires: 60
+  };
+
+  try {
+    const url = await s3.getSignedUrlPromise('putObject', params);
+    res.json({ url, key });
+  } catch (err) {
+    console.error('Presign error', err);
+    res.status(500).json({ message: 'Presign failed' });
+  }
+});
+
+// Record upload metadata after direct S3 upload
+app.post('/api/uploads/record', requireAuth, async (req, res) => {
+  const { key, originalName, mime, size } = req.body;
+  if (!key) return res.status(400).json({ message: 'Missing key' });
+  const id = uuidv4();
+  const url = process.env.S3_ENABLED === 'true' ? \`s3://\${process.env.S3_BUCKET}/\${key}\` : \`/uploads/\${key}\`;
+  await db.query('INSERT INTO uploads (id,filename,original_name,mime,size,url,uploaded_by) VALUES ($1,$2,$3,$4,$5,$6,$7)',
+    [id, key, originalName || key, mime || null, size || 0, url, req.user.id]);
+  const row = (await db.query('SELECT * FROM uploads WHERE id=$1', [id])).rows[0];
+  res.status(201).json(row);
+});
+
+// Admin-only example
+app.get('/api/admin/users', requireAuth, requireRole('admin'), async (req, res) => {
+  const rows = (await db.query('SELECT id,name,email,role,created_at FROM users ORDER BY created_at DESC')).rows;
+  res.json(rows);
+});
+
+// Dashboard
+app.get('/api/dashboard', requireAuth, async (req, res) => {
+  const totalContacts = (await db.query('SELECT COUNT(*) as c FROM contacts')).rows[0].c;
+  const totalDeals = (await db.query('SELECT COUNT(*) as c FROM deals')).rows[0].c;
+  const openDeals = (await db.query("SELECT COUNT(*) as c FROM deals WHERE pipeline_stage NOT IN ('Won','Lost')")).rows[0].c;
+  const recentActivities = (await db.query('SELECT * FROM activities ORDER BY activity_date DESC LIMIT 20')).rows;
+  res.json({ stats: { totalContacts, totalDeals, openDeals }, recentActivities });
+});
+
+app.use('/uploads', express.static(UPLOAD_DIR));
+
+app.listen(PORT, () => {
+  console.log(\`CRM backend running on http://localhost:\${PORT}\`);
+});
+EOF
+
+########################
+# FRONTEND files
+########################
+
+cat > frontend/package.json <<'EOF'
+{
+  "name": "roofing-crm-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "axios": "^1.4.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-scripts": "5.0.1"
+  },
+  "scripts": {
+    "start": "react-scripts start",
+    "build": "react-scripts build"
+  }
+}
+EOF
+
+mkdir -p frontend/src/components
+
+cat > frontend/src/api.js <<'EOF'
+import axios from 'axios';
+const API = axios.create({ baseURL: process.env.REACT_APP_API_URL || 'http://localhost:4000/api' });
+
+API.interceptors.request.use(config => {
+  const token = localStorage.getItem('token');
+  if (token) config.headers.Authorization = `Bearer ${token}`;
+  return config;
+});
+
+export default API;
+EOF
+
+cat > frontend/src/auth.js <<'EOF'
+export function saveAuth(user, token) {
+  localStorage.setItem('user', JSON.stringify(user));
+  localStorage.setItem('token', token);
+}
+
+export function clearAuth() {
+  localStorage.removeItem('user');
+  localStorage.removeItem('token');
+}
+
+export function getUser() {
+  const s = localStorage.getItem('user');
+  return s ? JSON.parse(s) : null;
+}
+EOF
+
+cat > frontend/src/index.js <<'EOF'
+import React from 'react';
+import { createRoot } from 'react-dom/client';
+import App from './App';
+import './styles.css';
+
+createRoot(document.getElementById('root')).render(<App />);
+EOF
+
+cat > frontend/src/App.js <<'EOF'
+import React, { useEffect, useState } from 'react';
+import Contacts from './components/Contacts';
+import Deals from './components/Deals';
+import Activities from './components/Activities';
+import Login from './components/Login';
+import API from './api';
+import { getUser, clearAuth } from './auth';
+
+export default function App() {
+  const [dashboard, setDashboard] = useState(null);
+  const [user, setUser] = useState(getUser());
+
+  useEffect(() => {
+    if (user) {
+      API.get('/dashboard').then(r => setDashboard(r.data)).catch(()=>{});
+    }
+  }, [user]);
+
+  function onLogin(u) {
+    setUser(u);
+    API.get('/dashboard').then(r => setDashboard(r.data)).catch(()=>{});
+  }
+
+  function logout() {
+    clearAuth();
+    setUser(null);
+    setDashboard(null);
+  }
+
+  if (!user) return <div style={{padding:20}}><Login onLogin={onLogin} /></div>;
+
+  return (
+    <div className="app">
+      <header>
+        <h1>Roofing CRM</h1>
+        <div>
+          <span style={{marginRight:12}}>Hello, {user.name}</span>
+          <button onClick={logout}>Logout</button>
+        </div>
+      </header>
+
+      <main style={{display:'flex', gap:12, padding:12}}>
+        <div style={{width:'30%'}}><Contacts /></div>
+        <div style={{width:'40%'}}><Deals /></div>
+        <div style={{width:'30%'}}><Activities /></div>
+      </main>
+    </div>
+  );
+}
+EOF
+
+cat > frontend/src/styles.css <<'EOF'
+body { font-family: Arial, Helvetica, sans-serif; margin:0; padding:0; background:#f4f6f8; }
+.app header { background:#0b5; padding:12px; color:#003; display:flex; justify-content:space-between; align-items:center; }
+.app main { display:flex; gap:12px; padding:12px; }
+.card { border:1px solid #eee; padding:8px; margin-bottom:8px; border-radius:4px; background:#fff; }
+button { padding:6px 10px; border-radius:4px; border:none; background:#0b5; color:#003; cursor:pointer; }
+input, select, textarea { width:100%; padding:6px; margin:6px 0; box-sizing:border-box; border:1px solid #ddd; border-radius:4px; }
+h2, h3, h4 { margin:8px 0; }
+EOF
+
+cat > frontend/src/components/Login.js <<'EOF'
+import React, { useState } from 'react';
+import API from '../api';
+import { saveAuth } from '../auth';
+
+export default function Login({ onLogin }) {
+  const [form, setForm] = useState({ email:'', password:'' });
+  const [error, setError] = useState('');
+
+  async function submit(e) {
+    e.preventDefault();
+    try {
+      const res = await API.post('/login', form);
+      saveAuth(res.data.user, res.data.accessToken || res.data.token);
+      onLogin(res.data.user);
+    } catch (err) {
+      setError(err.response?.data?.message || 'Login failed');
+    }
+  }
+
+  return (
+    <div style={{maxWidth:420, margin:'40px auto', background:'#fff', padding:20, borderRadius:8}}>
+      <h3>Login</h3>
+      <form onSubmit={submit}>
+        <input placeholder="Email" value={form.email} onChange={e=>setForm({...form,email:e.target.value})} />
+        <input placeholder="Password" type="password" value={form.password} onChange={e=>setForm({...form,password:e.target.value})} />
+        <button type="submit">Login</button>
+      </form>
+      {error && <div style={{color:'red', marginTop:8}}>{error}</div>}
+    </div>
+  );
+}
+EOF
+
+cat > frontend/src/components/Contacts.js <<'EOF'
+import React, { useEffect, useState } from 'react';
+import API from '../api';
+
+export default function Contacts() {
+  const [contacts, setContacts] = useState([]);
+  const [form, setForm] = useState({ first_name:'', last_name:'', phone:'', email:'', company_name:'', source:'' });
+  const [file, setFile] = useState(null);
+
+  useEffect(() => { load(); }, []);
+
+  function load() {
+    API.get('/contacts').then(r => setContacts(r.data)).catch(() => {});
+  }
+
+  function save(e) {
+    e.preventDefault();
+    API.post('/contacts', form).then(() => { setForm({ first_name:'', last_name:'', phone:'', email:'', company_name:'', source:'' }); load(); });
+  }
+
+  async function uploadFile(e) {
+    e.preventDefault();
+    if (!file) return;
+    const fd = new FormData();
+    fd.append('file', file);
+    await API.post('/uploads', fd, { headers: { 'Content-Type': 'multipart/form-data' } });
+    setFile(null);
+    alert('Uploaded');
+  }
+
+  return (
+    <div>
+      <h2>Contacts</h2>
+      <form onSubmit={save}>
+        <input placeholder="First name" value={form.first_name} onChange={e=>setForm({...form, first_name:e.target.value})} />
+        <input placeholder="Last name" value={form.last_name} onChange={e=>setForm({...form, last_name:e.target.value})} />
+        <input placeholder="Phone" value={form.phone} onChange={e=>setForm({...form, phone:e.target.value})} />
+        <input placeholder="Email" value={form.email} onChange={e=>setForm({...form, email:e.target.value})} />
+        <input placeholder="Company" value={form.company_name} onChange={e=>setForm({...form, company_name:e.target.value})} />
+        <input placeholder="Source" value={form.source} onChange={e=>setForm({...form, source:e.target.value})} />
+        <button type="submit">Add Contact</button>
+      </form>
+
+      <form onSubmit={uploadFile} style={{marginTop:12}}>
+        <input type="file" onChange={e=>setFile(e.target.files[0])} />
+        <button type="submit">Upload Photo</button>
+      </form>
+
+      <div style={{marginTop:12}}>
+        {contacts.map(c => (
+          <div key={c.id} className="card">
+            <strong>{c.first_name} {c.last_name}</strong>
+            <div>{c.company_name}</div>
+            <div>{c.phone} • {c.email}</div>
+            <div>Source: {c.source} • Status: {c.status}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+EOF
+
+cat > frontend/src/components/Deals.js <<'EOF'
+import React, { useEffect, useState } from 'react';
+import API from '../api';
+
+const STAGES = ['New','Contacted','Inspection','Proposal','Negotiation','Won','Lost'];
+
+export default function Deals() {
+  const [deals, setDeals] = useState([]);
+  const [contacts, setContacts] = useState([]);
+  const [form, setForm] = useState({ contact_id:'', title:'', estimated_value:0 });
+
+  useEffect(() => { load(); }, []);
+
+  function load() {
+    API.get('/deals').then(r => setDeals(r.data)).catch(()=>{});
+    API.get('/contacts').then(r => setContacts(r.data)).catch(()=>{});
+  }
+
+  function save(e) {
+    e.preventDefault();
+    API.post('/deals', form).then(()=> { setForm({ contact_id:'', title:'', estimated_value:0 }); load(); });
+  }
+
+  function move(dealId, stage) {
+    API.put(`/deals/${dealId}`, { pipeline_stage: stage }).then(()=>load());
+  }
+
+  const grouped = STAGES.map(stage => ({ stage, items: deals.filter(d => d.pipeline_stage === stage) }));
+
+  return (
+    <div>
+      <h2>Deals Pipeline</h2>
+
+      <form onSubmit={save} style={{marginBottom:12}}>
+        <select value={form.contact_id} onChange={e=>setForm({...form, contact_id:e.target.value})}>
+          <option value="">Select contact</option>
+          {contacts.map(c => <option key={c.id} value={c.id}>{c.first_name} {c.last_name}</option>)}
+        </select>
+        <input placeholder="Title" value={form.title} onChange={e=>setForm({...form, title:e.target.value})} />
+        <input type="number" placeholder="Estimated value" value={form.estimated_value} onChange={e=>setForm({...form, estimated_value:parseFloat(e.target.value||0)})} />
+        <button type="submit">Create Deal</button>
+      </form>
+
+      <div style={{display:'flex', gap:8, overflowX:'auto'}}>
+        {grouped.map(g => (
+          <div key={g.stage} style={{minWidth:180}}>
+            <h4>{g.stage}</h4>
+            {g.items.map(d => (
+              <div key={d.id} className="card">
+                <div><strong>{d.title}</strong></div>
+                <div>Value: ${d.estimated_value}</div>
+                <div>Stage: {d.pipeline_stage}</div>
+                <div style={{marginTop:6}}>
+                  {STAGES.filter(s => s !== d.pipeline_stage).map(s => (
+                    <button key={s} onClick={()=>move(d.id,s)} style={{marginRight:6}}>{s}</button>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+EOF
+
+cat > frontend/src/components/Activities.js <<'EOF'
+import React, { useEffect, useState } from 'react';
+import API from '../api';
+
+export default function Activities() {
+  const [activities, setActivities] = useState([]);
+  const [deals, setDeals] = useState([]);
+  const [form, setForm] = useState({ deal_id:'', type:'call', description:'' });
+
+  useEffect(() => { load(); }, []);
+
+  function load() {
+    API.get('/activities').then(r => setActivities(r.data)).catch(()=>{});
+    API.get('/deals').then(r => setDeals(r.data)).catch(()=>{});
+  }
+
+  function save(e) {
+    e.preventDefault();
+    API.post('/activities', form).then(()=> { setForm({ deal_id:'', type:'call', description:'' }); load(); });
+  }
+
+  return (
+    <div>
+      <h2>Activities</h2>
+      <form onSubmit={save}>
+        <select value={form.deal_id} onChange={e=>setForm({...form, deal_id:e.target.value})}>
+          <option value="">Select deal</option>
+          {deals.map(d => <option key={d.id} value={d.id}>{d.title}</option>)}
+        </select>
+        <select value={form.type} onChange={e=>setForm({...form, type:e.target.value})}>
+          <option value="call">Call</option>
+          <option value="email">Email</option>
+          <option value="visit">Visit</option>
+          <option value="note">Note</option>
+        </select>
+        <textarea placeholder="Description" value={form.description} onChange={e=>setForm({...form, description:e.target.value})} />
+        <button type="submit">Add Activity</button>
+      </form>
+
+      <div style={{marginTop:12}}>
+        {activities.map(a => (
+          <div key={a.id} className="card">
+            <div><strong>{a.type}</strong> • {new Date(a.activity_date).toLocaleString()}</div>
+            <div>{a.description}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+EOF
+
+########################
+# DOCKER and DEPLOY
+########################
+
+cat > docker-compose.yml <<'EOF'
+version: '3.8'
+services:
+  db:
+    image: postgres:15
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: roofing_crm
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  backend:
+    build: ./backend
+    env_file:
+      - ./backend/docker.env.example
+    environment:
+      - DATABASE_URL=postgres://postgres:postgres@db:5432/roofing_crm
+      - JWT_SECRET=${JWT_SECRET:-replace_with_a_strong_secret}
+      - S3_ENABLED=${S3_ENABLED:-false}
+    depends_on:
+      - db
+    volumes:
+      - ./backend/uploads:/usr/src/app/uploads
+    ports:
+      - "4000:4000"
+
+  frontend:
+    build: ./frontend
+    environment:
+      - REACT_APP_API_URL=http://localhost:4000/api
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+
+  adminer:
+    image: adminer
+    restart: unless-stopped
+    ports:
+      - 8080:8080
+
+volumes:
+  db_data:
+EOF
+
+cat > docker-compose.prod.yml <<'EOF'
+version: '3.8'
+services:
+  db:
+    image: postgres:15
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: roofing_crm
+    volumes:
+      - db_data:/var/lib/postgresql/data
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    env_file:
+      - ./backend/.env
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+      - JWT_SECRET=${JWT_SECRET}
+      - S3_ENABLED=${S3_ENABLED}
+    depends_on:
+      - db
+    volumes:
+      - ./backend/uploads:/usr/src/app/uploads
+    expose:
+      - "4000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:4000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    depends_on:
+      - backend
+    expose:
+      - "80"
+
+  proxy:
+    image: nginx:stable-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./deploy/nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./frontend/build:/usr/share/nginx/html:ro
+      - ./deploy/certs:/etc/nginx/certs:ro
+    depends_on:
+      - frontend
+      - backend
+
+volumes:
+  db_data:
+EOF
+
+cat > backend/Dockerfile <<'EOF'
+FROM node:18-alpine
+
+WORKDIR /usr/src/app
+
+COPY package.json package-lock.json* ./
+RUN npm install --production
+
+COPY . .
+
+COPY ./bin ./bin
+RUN chmod +x ./bin/*.sh
+
+ENV NODE_ENV=production
+ENV PORT=4000
+
+EXPOSE 4000
+
+ENTRYPOINT ["./bin/entrypoint.sh"]
+CMD ["node", "server.js"]
+EOF
+
+cat > frontend/Dockerfile <<'EOF'
+FROM node:18-alpine as build
+WORKDIR /usr/src/app
+COPY package.json package-lock.json* ./
+RUN npm install
+COPY . .
+RUN npm run build
+
+FROM nginx:stable-alpine
+COPY --from=build /usr/src/app/build /usr/share/nginx/html
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]
+EOF
+
+mkdir -p deploy/nginx/conf.d deploy/certs
+cat > deploy/nginx/nginx.conf <<'EOF'
+user  nginx;
+worker_processes  auto;
+error_log  /var/log/nginx/error.log warn;
+pid        /var/run/nginx.pid;
+
+events { worker_connections 1024; }
+
+http {
+  include       /etc/nginx/mime.types;
+  default_type  application/octet-stream;
+  sendfile        on;
+  keepalive_timeout  65;
+
+  include /etc/nginx/conf.d/*.conf;
+}
+EOF
+
+cat > deploy/nginx/conf.d/roofing-crm.conf <<'EOF'
+server {
+  listen 80;
+  server_name _;
+
+  location / {
+    try_files $uri $uri/ /index.html;
+  }
+
+  location /api/ {
+    proxy_pass http://backend:4000/api/;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+  }
+
+  location /uploads/ {
+    proxy_pass http://backend:4000/uploads/;
+  }
+}
+EOF
+
+########################
+# CI
+########################
+
+cat > .github/workflows/ci.yml <<'EOF'
+name: CI Build and Push
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      REGISTRY: ghcr.io
+      IMAGE_NAMESPACE: ${{ github.repository_owner }}/roofing-crm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push backend image
+        uses: docker/build-push-action@v4
+        with:
+          context: ./backend
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}-backend:latest
+
+      - name: Build and push frontend image
+        uses: docker/build-push-action@v4
+        with:
+          context: ./frontend
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}-frontend:latest
+
+      - name: Run tests (optional)
+        run: |
+          echo "Add test commands here"
+EOF
+
+########################
+# Final notes file
+########################
+
+cat > README_SETUP.md <<'EOF'
+Roofing CRM Setup Notes
+
+1. Copy backend/docker.env.example to backend/.env and set:
+   - JWT_SECRET (strong random string)
+   - ADMIN_EMAIL, ADMIN_PASSWORD, ADMIN_NAME
+   - If using S3: set S3_ENABLED=true and S3_* variables
+
+2. Build and run with Docker:
+   docker-compose up --build
+
+3. Run migrations and seed (if not auto-run):
+   docker-compose exec backend node migrate.js
+   docker-compose exec backend node seed-admin.js
+
+4. Open:
+   - Frontend: http://localhost:3000
+   - Backend API: http://localhost:4000/api
+   - Adminer: http://localhost:8080 (host: db, user: postgres, pass: postgres)
+
+5. For production, use docker-compose.prod.yml and set production env vars.
+
+EOF
+
+echo "All files created under $(pwd)."
+echo "Next steps:"
+echo "  1) cd $ROOT"
+echo "  2) edit backend/.env (copy from backend/docker.env.example)"
+echo "  3) docker-compose up --build"
+echo "  4) docker-compose exec backend node migrate.js"
+echo "  5) docker-compose exec backend node seed-admin.js"
