@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MCR Roofing CRM</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <section class="login-screen" id="login-screen">
+      <div class="login-card">
+        <div class="brand-mark">MCR</div>
+        <p class="eyebrow">Roofing operations</p>
+        <h1>Sign in to MCR CRM</h1>
+        <form id="login-form">
+          <input name="username" autocomplete="username" placeholder="Username" required />
+          <input name="password" type="password" autocomplete="current-password" placeholder="Password" required />
+          <button class="primary-btn" type="submit">Sign in</button>
+          <p class="login-error" id="login-error" role="alert"></p>
+        </form>
+      </div>
+    </section>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <button class="brand" id="brand-home" type="button" aria-label="Go to dashboard">
+          <div class="brand-mark">MCR</div>
+          <div>
+            <h1>MCR CRM</h1>
+            <p>Roofing operations</p>
+          </div>
+        </button>
+
+        <nav class="main-nav">
+          <button class="nav-item active" data-tab="dashboard">Dashboard</button>
+          <button class="nav-item" data-tab="leads">Leads</button>
+          <button class="nav-item" data-tab="jobs">Jobs</button>
+          <button class="nav-item" data-tab="estimates">Estimates</button>
+          <button class="nav-item" data-tab="customers">Customers</button>
+          <button class="nav-item" data-tab="reports">Reports</button>
+        </nav>
+      </aside>
+
+      <main class="main-panel">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">Commercial & residential</p>
+            <h2 id="page-title">Operations dashboard</h2>
+          </div>
+          <button class="secondary-btn logout-btn" id="logout-btn" type="button">Log out</button>
+        </header>
+        <div class="viewer-notice" id="viewer-notice" hidden>Viewer access: records and reports are read-only.</div>
+
+        <section class="tab-panel active" id="dashboard-panel">
+          <div class="metrics" id="overview"></div>
+          <div class="content-grid">
+            <div class="panel">
+              <div class="panel-header">
+                <h3>Leads pipeline</h3>
+                <span>Updated today</span>
+              </div>
+              <div id="leads" class="table-list"></div>
+            </div>
+            <div class="panel">
+              <div class="panel-header">
+                <h3>Active jobs</h3>
+                <span>Field progress</span>
+              </div>
+              <div id="jobs" class="jobs-list"></div>
+            </div>
+          </div>
+          <div class="bottom-grid">
+            <div class="panel">
+              <div class="panel-header">
+                <h3>Estimates</h3>
+                <span>Latest quotes</span>
+              </div>
+              <div id="estimates" class="estimate-list"></div>
+            </div>
+            <div class="panel form-panel">
+              <div class="panel-header">
+                <h3>Add lead</h3>
+                <span>Quick capture</span>
+              </div>
+              <form id="lead-form">
+                <input name="customer" placeholder="Customer name" required />
+                <input name="phone" placeholder="Phone" required />
+                <input name="source" placeholder="Lead source" />
+                <input name="value" type="number" placeholder="Project value" />
+                <select name="status">
+                  <option>New</option>
+                  <option>Qualified</option>
+                  <option>Hot</option>
+                  <option>Scheduled</option>
+                </select>
+                <button class="primary-btn" type="submit">Save lead</button>
+              </form>
+            </div>
+          </div>
+        </section>
+
+        <section class="tab-panel" id="leads-panel">
+          <div class="panel full-width-panel">
+            <div class="panel-header">
+              <h3>Lead list</h3>
+              <span>Manage pipeline</span>
+            </div>
+            <div id="lead-list-full" class="table-list"></div>
+          </div>
+          <div class="panel form-panel">
+            <div class="panel-header">
+              <h3 class="lead-form-title">Add lead</h3>
+              <span>Quick capture</span>
+            </div>
+            <form id="lead-form-full">
+              <input name="customer" placeholder="Customer name" required />
+              <input name="phone" placeholder="Phone" required />
+              <input name="source" placeholder="Lead source" />
+              <input name="value" type="number" placeholder="Project value" />
+              <select name="status">
+                <option>New</option>
+                <option>Qualified</option>
+                <option>Hot</option>
+                <option>Scheduled</option>
+              </select>
+              <input name="nextAction" placeholder="Next action" />
+              <input name="stage" placeholder="Pipeline stage" value="New" />
+              <button class="primary-btn lead-form-submit" type="submit">Save lead</button>
+            </form>
+          </div>
+        </section>
+
+        <section class="tab-panel" id="jobs-panel">
+          <div class="panel full-width-panel">
+            <div class="panel-header">
+              <h3>Jobs</h3>
+              <div class="panel-header-actions">
+                <span>Field execution</span>
+                <button class="primary-btn create-job-action" id="create-job-action" type="button">Create job</button>
+              </div>
+            </div>
+            <div id="job-list-full" class="jobs-list"></div>
+          </div>
+          <div class="panel form-panel">
+            <div class="panel-header">
+              <h3 id="job-form-title">Add job</h3>
+              <span>Book work</span>
+            </div>
+            <form id="job-form">
+              <div class="form-grid">
+                <input name="customer" placeholder="Customer" required />
+                <input name="phone" type="tel" placeholder="Customer phone" />
+                <input name="email" type="email" placeholder="Customer email" />
+                <input name="address" placeholder="Job site address" />
+                <input name="type" placeholder="Job type" required />
+                <input name="value" type="number" min="0" placeholder="Job value" required />
+                <select name="status">
+                  <option>Scheduled</option>
+                  <option>In progress</option>
+                  <option>On hold</option>
+                  <option>Completed</option>
+                </select>
+                <input name="crew" placeholder="Crew" />
+                <input name="scheduledDate" type="date" aria-label="Scheduled date" />
+                <input name="completionDate" type="date" aria-label="Completion date" />
+                <input name="nextMilestone" placeholder="Next milestone" />
+              </div>
+              <textarea name="scope" rows="3" placeholder="Scope of work"></textarea>
+              <textarea name="materials" rows="2" placeholder="Materials and selections"></textarea>
+              <textarea name="notes" rows="2" placeholder="Job notes"></textarea>
+              <button class="primary-btn" id="job-form-submit" type="submit">Save job</button>
+            </form>
+          </div>
+        </section>
+
+        <section class="tab-panel" id="estimates-panel">
+          <div class="estimate-overview" id="estimate-overview"></div>
+          <div class="panel full-width-panel">
+            <div class="panel-header">
+              <h3>Estimate workspace</h3>
+              <span>Review, present, and send quotes</span>
+            </div>
+            <div id="estimate-list-full" class="estimate-list"></div>
+          </div>
+          <div class="panel estimate-detail-panel" id="estimate-detail" hidden></div>
+          <div class="panel form-panel">
+            <div class="panel-header">
+              <h3 id="estimate-form-title">Create estimate</h3>
+              <span>New quote</span>
+            </div>
+              <form id="estimate-form">
+                <div class="form-grid">
+                  <input name="customer" placeholder="Customer name" required />
+                  <input name="phone" type="tel" placeholder="Phone" />
+                  <input name="email" type="email" placeholder="Email" />
+                  <input name="project" placeholder="Project name" required />
+                  <input name="validUntil" type="date" aria-label="Estimate valid until" />
+                  <select name="status" aria-label="Estimate status">
+                    <option>Draft</option>
+                    <option>Sent</option>
+                    <option>Awaiting approval</option>
+                    <option>Approved</option>
+                    <option>Declined</option>
+                  </select>
+                </div>
+                <textarea name="scope" rows="3" placeholder="Scope of work"></textarea>
+                <div class="line-items-header">
+                  <strong>Line items</strong>
+                  <button class="secondary-btn" id="add-line-item" type="button">Add item</button>
+                </div>
+                <div id="estimate-line-items" class="line-items">
+                  <div class="line-item">
+                    <input name="description" placeholder="Description" required />
+                    <input name="quantity" type="number" min="0" step="0.01" value="1" placeholder="Qty" aria-label="Quantity" required />
+                    <input name="unitPrice" type="number" min="0" step="0.01" placeholder="Unit price" aria-label="Unit price" required />
+                    <button class="icon-btn remove-line-item" type="button" aria-label="Remove line item">Remove</button>
+                  </div>
+                </div>
+                <div class="form-grid estimate-adjustments">
+                  <label class="field-label">Discount ($)
+                    <input name="discount" type="number" min="0" step="0.01" value="0" placeholder="0.00" aria-label="Discount in dollars" />
+                  </label>
+                  <label class="field-label">Tax rate (%)
+                    <input name="taxRate" type="number" min="0" step="0.01" value="0" placeholder="0" aria-label="Tax rate percentage" />
+                  </label>
+                </div>
+                <textarea name="notes" rows="2" placeholder="Customer notes or payment terms"></textarea>
+                <div id="estimate-total-preview" class="estimate-total-preview">Total $0</div>
+                <button class="primary-btn" id="estimate-form-submit" type="submit">Create estimate</button>
+              </form>
+          </div>
+        </section>
+
+        <section class="tab-panel" id="customers-panel">
+          <div class="panel full-width-panel">
+            <div class="panel-header">
+              <h3>Customers</h3>
+              <span>Account directory</span>
+            </div>
+            <div id="customers" class="customer-grid"></div>
+          </div>
+          <div class="panel form-panel">
+            <div class="panel-header">
+              <h3 id="customer-form-title">Add customer</h3>
+              <span>Customer details</span>
+            </div>
+            <form id="customer-form">
+              <div class="form-grid">
+                <input name="name" placeholder="Customer name" required />
+                <input name="phone" type="tel" placeholder="Phone" />
+                <input name="email" type="email" placeholder="Email" />
+                <input name="address" placeholder="Address" />
+                <select name="status">
+                  <option>Active</option>
+                  <option>Past customer</option>
+                  <option>Inactive</option>
+                </select>
+              </div>
+              <textarea name="notes" rows="3" placeholder="Notes"></textarea>
+              <button class="primary-btn" id="customer-form-submit" type="submit">Save customer</button>
+            </form>
+          </div>
+        </section>
+
+        <section class="tab-panel" id="reports-panel">
+          <div class="panel full-width-panel">
+            <div class="panel-header">
+              <h3>Reports</h3>
+              <span id="report-range-label">All time</span>
+            </div>
+            <div class="report-controls">
+              <label>From <input id="report-from" type="date" /></label>
+              <label>To <input id="report-to" type="date" /></label>
+              <button class="primary-btn" id="run-report" type="button">Run report</button>
+            </div>
+            <div id="reports" class="report-grid report-layout"></div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <script src="app.js"></script>
+  </body>
+</html>

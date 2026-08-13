@@ -1,0 +1,22 @@
+{
+  "name": "work-crm-for-mcr",
+  "version": "1.0.0",
+  "description": "Roofing CRM dashboard for MCR",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "keywords": [
+    "crm",
+    "roofing",
+    "dashboard"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "pg": "^8.16.3"
+  }
+}
